@@ -1,0 +1,12 @@
+{
+  "background_color": "#ffffff",
+  "dir": "ltr",
+  "display": "standalone",
+  "name": "Ironlog",
+  "orientation": "any",
+  "scope": "/",
+  "short_name": "Ironlog",
+  "start_url": "/ironlog/home",
+  "theme_color": "#ffffff",
+  "id": "ironlog.01"
+}
