@@ -1,4 +1,4 @@
-const CACHE = 'ironlog-v2';
+const CACHE = 'ironlog-v3';
 const ASSETS = ['./'];
 
 self.addEventListener('install', e => {

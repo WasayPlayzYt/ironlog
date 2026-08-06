@@ -139,6 +139,22 @@ h2.section-title:first-child{margin-top:6px;}
 .exlist-item{display:flex;justify-content:space-between;align-items:center;padding:11px 4px;border-bottom:1px solid var(--border);}
 .exlist-item:last-child{border-bottom:none;}
 .exlist-item .n{font-weight:600;font-size:14.5px;}
+
+.drag-handle{cursor:grab;padding:6px 10px 6px 2px;color:var(--text-faint);font-size:18px;line-height:1;user-select:none;touch-action:none;}
+.drag-handle:active{cursor:grabbing;color:var(--text-dim);}
+.rt-ex-block{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);margin-bottom:12px;overflow:hidden;}
+.rt-ex-head{display:flex;align-items:center;padding:10px 12px;border-bottom:1px solid var(--border);gap:6px;}
+.rt-ex-head .n{flex:1;font-weight:700;font-size:14.5px;}
+.rt-set-row{display:grid;grid-template-columns:24px 1fr 1fr 28px;gap:8px;align-items:center;padding:6px 12px;}
+.rt-set-row input{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);
+  border-radius:6px;padding:6px;text-align:center;font-size:13.5px;}
+.rt-set-row input:focus{outline:none;border-color:var(--accent);}
+.rt-add-set{padding:8px 12px;color:var(--accent);font-weight:700;font-size:12.5px;text-align:center;}
+.rt-rest-row{padding:8px 12px 12px;border-top:1px solid var(--border);}
+.rt-rest-row label{display:block;font-size:10.5px;color:var(--text-dim);text-transform:uppercase;letter-spacing:0.04em;margin-bottom:5px;}
+.rt-rest-row input{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);
+  padding:8px 10px;border-radius:7px;font-size:14px;}
+.rt-rest-row input:focus{outline:none;border-color:var(--accent);}
 .exlist-item .c{font-size:11px;color:var(--text-faint);}
 .addicon{width:26px;height:26px;border-radius:50%;background:var(--surface3);color:var(--accent);border:none;font-size:16px;
   display:flex;align-items:center;justify-content:center;}
@@ -632,6 +648,63 @@ const BUILTIN_EXERCISES = [
 
 let state = load();
 
+/* migrate old routine format (targetSets/targetReps) to new per-set model */
+function migrateRoutineExercise(e){
+  if(e.sets && Array.isArray(e.sets)) return e;
+  const ts = e.targetSets||3, tr = e.targetReps||10;
+  return {exerciseId:e.exerciseId, sets:Array.from({length:ts},()=>({weight:0,reps:tr})), restSeconds:null};
+}
+(state.routines||[]).forEach(r=>{ r.exercises = (r.exercises||[]).map(migrateRoutineExercise); });
+save();
+
+/* generic press-and-drag reordering for a list of DOM items backed by an array.
+   itemSelector elements must contain a child with class "drag-handle" (data-i = current index). */
+function makeReorderable(containerEl, itemSelector, arrayRef, onChange){
+  if(!containerEl) return;
+  containerEl.querySelectorAll(itemSelector).forEach((item)=>{
+    const handle = item.querySelector(".drag-handle");
+    if(!handle) return;
+    handle.style.touchAction = "none";
+    handle.onpointerdown = (e)=>{
+      e.preventDefault();
+      const origIndex = Array.from(containerEl.querySelectorAll(itemSelector)).indexOf(item);
+      let startY = e.clientY;
+      item.style.position = "relative";
+      item.style.zIndex = "50";
+      item.style.opacity = "0.88";
+      item.style.boxShadow = "0 8px 20px rgba(0,0,0,0.45)";
+      try{ handle.setPointerCapture(e.pointerId); }catch(err){}
+      const move = (ev)=>{
+        const dy = ev.clientY - startY;
+        item.style.transform = `translateY(${dy}px)`;
+      };
+      const up = (ev)=>{
+        item.style.transform = "";
+        item.style.opacity = "";
+        item.style.boxShadow = "";
+        item.style.zIndex = "";
+        const siblings = Array.from(containerEl.querySelectorAll(itemSelector)).filter(el=>el!==item);
+        let newIndex = siblings.length;
+        for(let i=0;i<siblings.length;i++){
+          const r = siblings[i].getBoundingClientRect();
+          const mid = r.top + r.height/2;
+          if(ev.clientY < mid){ newIndex = i; break; }
+        }
+        handle.onpointermove = null;
+        handle.onpointerup = null;
+        try{ handle.releasePointerCapture(ev.pointerId); }catch(err){}
+        if(newIndex !== origIndex){
+          const [moved] = arrayRef.splice(origIndex,1);
+          arrayRef.splice(newIndex,0,moved);
+          onChange();
+        }
+      };
+      handle.onpointermove = move;
+      handle.onpointerup = up;
+    };
+  });
+}
+
 function load(){
   try{
     const raw = localStorage.getItem(STORE_KEY);
@@ -708,7 +781,6 @@ function render(){
 }
 
 function renderHome(){
-  const recent = [...state.history].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,4);
   const totalVolume = state.history.reduce((s,w)=>s+w.exercises.reduce((s2,e)=>s2+e.sets.reduce((s3,st)=>st.completed?s3+st.weight*st.reps:s3,0),0),0);
 
   let html = `
@@ -730,7 +802,7 @@ function renderHome(){
   if(state.routines.length===0){
     html += `<div class="empty-state"><div class="big">🏋️</div>No routines yet.<br><span style="color:var(--accent);font-weight:700">Build one in the Routines tab.</span></div>`;
   } else {
-    html += state.routines.slice(0,4).map(r=>`
+    html += state.routines.map(r=>`
       <div class="card row card-tap start-routine-card" data-id="${r.id}">
         <div>
           <div style="font-weight:700;font-size:15px">${escapeHtml(r.name)}</div>
@@ -740,31 +812,11 @@ function renderHome(){
       </div>`).join("");
   }
 
-  html += `<h2 class="section-title">Recent Activity</h2>`;
-  if(recent.length===0){
-    html += `<div class="empty-state faint">No workouts logged yet.</div>`;
-  } else {
-    html += recent.map(w=>{
-      const vol = w.exercises.reduce((s,e)=>s+e.sets.reduce((s2,st)=>st.completed?s2+st.weight*st.reps:s2,0),0);
-      const hasPR = w.exercises.some(e=>e.sets.some(s=>s.isPR));
-      return `<div class="card card-tap view-workout-card" data-id="${w.id}">
-        <div class="row">
-          <div style="font-weight:700">${escapeHtml(w.name||"Workout")} ${hasPR?'<span class="pr-badge">PR</span>':""}</div>
-          <div class="faint" style="font-size:12px">${fmtDate(w.date)}</div>
-        </div>
-        <div class="muted" style="font-size:12.5px;margin-top:4px">${w.exercises.length} exercises · ${vol.toLocaleString()} ${state.settings.unit} volume</div>
-      </div>`;
-    }).join("");
-  }
-
   screenEl.innerHTML = html;
 
   document.getElementById("startEmptyBtn").onclick = ()=>startWorkout(null);
   screenEl.querySelectorAll(".start-routine-card,.start-routine-btn").forEach(el=>{
     el.onclick = (e)=>{ e.stopPropagation(); startWorkout(el.dataset.id); };
-  });
-  screenEl.querySelectorAll(".view-workout-card").forEach(el=>{
-    el.onclick = ()=> openWorkoutDetail(el.dataset.id);
   });
 }
 
@@ -800,6 +852,7 @@ function renderRoutines(){
 function openRoutineEditor(routineId){
   const editing = routineId ? state.routines.find(r=>r.id===routineId) : null;
   let draft = editing ? JSON.parse(JSON.stringify(editing)) : {id:uid(), name:"", exercises:[]};
+  draft.exercises = draft.exercises.map(migrateRoutineExercise);
 
   function body(){
     return `
@@ -808,9 +861,24 @@ function openRoutineEditor(routineId){
     <h2 class="section-title" style="margin-top:16px">Exercises</h2>
     <div id="rExList">${draft.exercises.map((e,i)=>{
       const ex = exById(e.exerciseId);
-      return `<div class="exlist-item">
-        <div><div class="n">${ex?ex.name:"?"}</div><div class="c">${e.targetSets} sets × ${e.targetReps} reps</div></div>
-        <button class="delbtn rm-ex" data-i="${i}">✕</button>
+      return `<div class="rt-ex-block" data-i="${i}">
+        <div class="rt-ex-head">
+          <span class="drag-handle" data-i="${i}">⠿</span>
+          <div class="n">${ex?ex.name:"?"}</div>
+          <button class="delbtn rm-ex" data-i="${i}">✕</button>
+        </div>
+        ${e.sets.map((s,si)=>`
+          <div class="rt-set-row">
+            <span class="setnum">${si+1}</span>
+            <input type="number" inputmode="decimal" class="rtw" data-i="${i}" data-si="${si}" value="${s.weight||""}" placeholder="wt">
+            <input type="number" inputmode="numeric" class="rtr" data-i="${i}" data-si="${si}" value="${s.reps||""}" placeholder="reps">
+            <button class="delbtn rt-rm-set" data-i="${i}" data-si="${si}">✕</button>
+          </div>`).join("")}
+        <div class="addset rt-add-set" data-i="${i}">+ Add Set</div>
+        <div class="rt-rest-row">
+          <label>Rest timer (sec) — blank uses default (${state.settings.restSeconds}s)</label>
+          <input type="number" class="rt-rest" data-i="${i}" value="${e.restSeconds ?? ""}" placeholder="${state.settings.restSeconds}">
+        </div>
       </div>`;
     }).join("") || '<div class="faint" style="padding:8px 0">No exercises added yet.</div>'}</div>
     <button class="btn btn-ghost btn-block" id="addExBtn" style="margin:12px 0">+ Add Exercise</button>
@@ -821,16 +889,37 @@ function openRoutineEditor(routineId){
   wireRoutineEditorEvents();
 
   function wireRoutineEditorEvents(){
+    const list = document.getElementById("rExList");
     document.getElementById("mClose").onclick = closeModal;
     document.getElementById("rName").oninput = (e)=>draft.name=e.target.value;
     document.getElementById("addExBtn").onclick = ()=>{
       openExercisePicker((ex)=>{
-        draft.exercises.push({exerciseId:ex.id, targetSets:3, targetReps:10});
+        draft.exercises.push({exerciseId:ex.id, sets:[{weight:0,reps:10},{weight:0,reps:10},{weight:0,reps:10}], restSeconds:null});
         openModal(body()); wireRoutineEditorEvents();
       });
     };
     document.querySelectorAll(".rm-ex").forEach(b=>b.onclick=()=>{
       draft.exercises.splice(parseInt(b.dataset.i),1);
+      openModal(body()); wireRoutineEditorEvents();
+    });
+    document.querySelectorAll(".rtw").forEach(inp=>inp.onchange=(e)=>{
+      draft.exercises[inp.dataset.i].sets[inp.dataset.si].weight = parseFloat(inp.value)||0;
+    });
+    document.querySelectorAll(".rtr").forEach(inp=>inp.onchange=(e)=>{
+      draft.exercises[inp.dataset.i].sets[inp.dataset.si].reps = parseInt(inp.value)||0;
+    });
+    document.querySelectorAll(".rt-rest").forEach(inp=>inp.onchange=(e)=>{
+      const v = parseInt(inp.value);
+      draft.exercises[inp.dataset.i].restSeconds = v>0 ? v : null;
+    });
+    document.querySelectorAll(".rt-rm-set").forEach(b=>b.onclick=()=>{
+      draft.exercises[b.dataset.i].sets.splice(b.dataset.si,1);
+      openModal(body()); wireRoutineEditorEvents();
+    });
+    document.querySelectorAll(".rt-add-set").forEach(b=>b.onclick=()=>{
+      const sets = draft.exercises[b.dataset.i].sets;
+      const last = sets[sets.length-1];
+      sets.push({weight:last?last.weight:0, reps:last?last.reps:0});
       openModal(body()); wireRoutineEditorEvents();
     });
     document.getElementById("saveRoutineBtn").onclick = ()=>{
@@ -840,6 +929,7 @@ function openRoutineEditor(routineId){
       if(idx>=0) state.routines[idx]=draft; else state.routines.push(draft);
       save(); closeModal(); renderRoutines();
     };
+    makeReorderable(list, ".rt-ex-block", draft.exercises, ()=>{ openModal(body()); wireRoutineEditorEvents(); });
   }
 }
 
@@ -988,12 +1078,14 @@ function startWorkout(routineId){
   const routine = routineId ? state.routines.find(r=>r.id===routineId) : null;
   state.activeWorkout = {
     id: uid(),
+    routineId: routine ? routine.id : null,
     name: routine ? routine.name : "Empty Workout",
     date: new Date().toISOString(),
     startedAt: Date.now(),
     exercises: routine ? routine.exercises.map(e=>({
       exerciseId: e.exerciseId,
-      sets: Array.from({length:e.targetSets},()=>({weight:0,reps:e.targetReps,completed:false,isPR:false}))
+      restSeconds: e.restSeconds || null,
+      sets: e.sets.map(s=>({weight:s.weight||0, reps:s.reps||0, completed:false, isPR:false}))
     })) : []
   };
   save();
@@ -1018,8 +1110,8 @@ function renderWorkoutBody(){
   const body = document.getElementById("woBody");
   let html = w.exercises.map((e,ei)=>{
     const ex = exById(e.exerciseId);
-    return `<div class="exblock">
-      <div class="exblock-head"><div><div class="name">${ex?ex.name:"?"}</div><div class="cat">${ex?ex.cat:""}</div></div>
+    return `<div class="exblock" data-ei="${ei}">
+      <div class="exblock-head"><span class="drag-handle" data-ei="${ei}">⠿</span><div><div class="name">${ex?ex.name:"?"}</div><div class="cat">${ex?ex.cat:""}${e.restSeconds?` · ${e.restSeconds}s rest`:""}</div></div>
       <button class="delbtn rm-exblock" data-ei="${ei}">✕</button></div>
       <div class="setrow head"><div>Set</div><div>${state.settings.unit}</div><div>Reps</div><div></div><div></div></div>
       ${e.sets.map((s,si)=>`
@@ -1055,7 +1147,7 @@ function renderWorkoutBody(){
       const e1 = EPLEY(set.weight, set.reps);
       set.isPR = set.weight>0 && e1 > best;
       soundSetDone(set.isPR);
-      startRestTimer(state.settings.restSeconds);
+      startRestTimer(w.exercises[ei].restSeconds || state.settings.restSeconds);
     } else { set.isPR = false; soundSetUndo(); }
     save(); renderWorkoutBody();
   });
@@ -1071,11 +1163,12 @@ function renderWorkoutBody(){
   body.querySelectorAll(".rm-exblock").forEach(b=>b.onclick=()=>{
     w.exercises.splice(b.dataset.ei,1); save(); renderWorkoutBody();
   });
+  makeReorderable(body, ".exblock", w.exercises, ()=>{ save(); renderWorkoutBody(); });
 }
 
 function addExToActive(){
   openExercisePicker((ex)=>{
-    state.activeWorkout.exercises.push({exerciseId:ex.id, sets:[{weight:0,reps:10,completed:false,isPR:false}]});
+    state.activeWorkout.exercises.push({exerciseId:ex.id, restSeconds:null, sets:[{weight:0,reps:10,completed:false,isPR:false}]});
     soundAddEx();
     save(); closeModal(); renderWorkoutBody();
   });
@@ -1090,20 +1183,89 @@ document.getElementById("woCancel").onclick = ()=>{
   }
 };
 
+function routineDiffersFromWorkout(routine, workout){
+  if(routine.exercises.length !== workout.exercises.length) return true;
+  for(let i=0;i<workout.exercises.length;i++){
+    const re = routine.exercises[i], we = workout.exercises[i];
+    if(!re || re.exerciseId !== we.exerciseId) return true;
+    if(re.sets.length !== we.sets.length) return true;
+    for(let j=0;j<we.sets.length;j++){
+      if((re.sets[j].weight||0) !== (we.sets[j].weight||0) || (re.sets[j].reps||0) !== (we.sets[j].reps||0)) return true;
+    }
+  }
+  return false;
+}
+
+function applyRoutineUpdate(routine, workout, fullUpdate){
+  const idx = state.routines.findIndex(r=>r.id===routine.id);
+  if(idx<0) return;
+  const oldByExId = {};
+  routine.exercises.forEach(e=>{ oldByExId[e.exerciseId]=e; });
+  const newExercises = workout.exercises.map(we=>{
+    const old = oldByExId[we.exerciseId];
+    if(fullUpdate){
+      return {
+        exerciseId: we.exerciseId,
+        sets: we.sets.map(s=>({weight:s.weight||0, reps:s.reps||0})),
+        restSeconds: old ? old.restSeconds : (we.restSeconds || null)
+      };
+    }
+    if(old) return old;
+    return { exerciseId: we.exerciseId, sets: we.sets.map(s=>({weight:s.weight||0, reps:s.reps||0})), restSeconds: we.restSeconds || null };
+  });
+  state.routines[idx] = {...routine, exercises:newExercises};
+  save();
+}
+
 document.getElementById("woFinish").onclick = ()=>{
   const w = state.activeWorkout;
   const totalSets = w.exercises.reduce((s,e)=>s+e.sets.filter(s2=>s2.completed).length,0);
   if(totalSets===0){ if(!confirm("No sets completed. Finish anyway?")) return; }
   w.duration = Math.floor((Date.now()-w.startedAt)/1000);
   w.exercises = w.exercises.filter(e=>e.sets.some(s=>s.completed)).map(e=>({...e, sets:e.sets.filter(s=>s.completed)}));
-  state.history.push(w);
-  state.activeWorkout = null;
-  save();
-  clearInterval(woInterval);
-  document.getElementById("workoutOverlay").classList.remove("open");
-  stopRestTimer();
-  soundWorkoutDone();
-  currentTab = "home"; render();
+
+  const sourceRoutine = w.routineId ? state.routines.find(r=>r.id===w.routineId) : null;
+
+  function finalizeWorkout(){
+    state.history.push(w);
+    state.activeWorkout = null;
+    save();
+    clearInterval(woInterval);
+    document.getElementById("workoutOverlay").classList.remove("open");
+    stopRestTimer();
+    soundWorkoutDone();
+    currentTab = "home"; render();
+  }
+
+  if(sourceRoutine && routineDiffersFromWorkout(sourceRoutine, w)){
+    openModal(`
+      <div class="modal-title">Update Routine?<span class="x" id="mCloseA">&times;</span></div>
+      <div class="muted" style="margin-bottom:16px">Today's workout was different from "${escapeHtml(sourceRoutine.name)}". Update the routine to match what you did?</div>
+      <button class="btn btn-ghost btn-block" id="keepRoutineBtn" style="margin-bottom:8px">Keep Routine As-Is</button>
+      <button class="btn btn-primary btn-block" id="updateRoutineBtn">Update Routine</button>
+    `);
+    document.getElementById("mCloseA").onclick = ()=>{ closeModal(); finalizeWorkout(); };
+    document.getElementById("keepRoutineBtn").onclick = ()=>{ closeModal(); finalizeWorkout(); };
+    document.getElementById("updateRoutineBtn").onclick = ()=>{
+      openModal(`
+        <div class="modal-title">Update Sets & Weights Too?<span class="x" id="mCloseB">&times;</span></div>
+        <div class="muted" style="margin-bottom:16px">Should the routine also adopt today's exact sets, reps, and weights as its new defaults?</div>
+        <button class="btn btn-ghost btn-block" id="justExBtn" style="margin-bottom:8px">Just Update Exercise List</button>
+        <button class="btn btn-primary btn-block" id="fullUpdateBtn">Update Everything</button>
+      `);
+      document.getElementById("mCloseB").onclick = ()=>{ closeModal(); finalizeWorkout(); };
+      document.getElementById("justExBtn").onclick = ()=>{
+        applyRoutineUpdate(sourceRoutine, w, false);
+        closeModal(); finalizeWorkout();
+      };
+      document.getElementById("fullUpdateBtn").onclick = ()=>{
+        applyRoutineUpdate(sourceRoutine, w, true);
+        closeModal(); finalizeWorkout();
+      };
+    };
+  } else {
+    finalizeWorkout();
+  }
 };
 
 if(state.activeWorkout){
