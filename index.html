@@ -988,9 +988,21 @@ function openCustomExerciseForm(onPick){
 }
 
 /* ========== AUDIO + HAPTICS ENGINE ========== */
-let _actx = null;
+let _actx = null, _compressor = null, _masterGain = null;
 function getACtx(){
-  if(!_actx) _actx = new (window.AudioContext||window.webkitAudioContext)();
+  if(!_actx){
+    _actx = new (window.AudioContext||window.webkitAudioContext)();
+    _compressor = _actx.createDynamicsCompressor();
+    _compressor.threshold.value = -16;
+    _compressor.knee.value = 22;
+    _compressor.ratio.value = 10;
+    _compressor.attack.value = 0.002;
+    _compressor.release.value = 0.18;
+    _masterGain = _actx.createGain();
+    _masterGain.gain.value = 1.6; /* overall loudness boost, safe because it's limited by the compressor below */
+    _masterGain.connect(_compressor);
+    _compressor.connect(_actx.destination);
+  }
   if(_actx.state==='suspended') _actx.resume();
   return _actx;
 }
@@ -1000,7 +1012,7 @@ function beep(freq=880, dur=0.08, vol=0.4, type='sine', delay=0){
     const ctx = getACtx();
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
-    osc.connect(gain); gain.connect(ctx.destination);
+    osc.connect(gain); gain.connect(_masterGain);
     osc.type = type; osc.frequency.value = freq;
     const t = ctx.currentTime + delay;
     gain.gain.setValueAtTime(0, t);
@@ -1014,59 +1026,60 @@ function haptic(pattern){
   try{ if(navigator.vibrate) navigator.vibrate(pattern); }catch(e){}
 }
 
-/* set completed: single soft tick */
+/* set completed: crisp tick */
 function soundSetDone(isPR){
   if(isPR){
-    beep(523,0.08,0.35,'sine');
-    beep(659,0.08,0.35,'sine',0.09);
-    beep(784,0.12,0.4,'sine',0.18);
-    beep(1047,0.18,0.45,'sine',0.30);
+    beep(523,0.09,0.6,'triangle');
+    beep(659,0.09,0.6,'triangle',0.09);
+    beep(784,0.14,0.68,'triangle',0.18);
+    beep(1047,0.22,0.75,'triangle',0.30);
     haptic([30,30,60,30,100]);
   } else {
-    beep(660,0.06,0.3,'sine');
+    beep(660,0.07,0.55,'triangle');
     haptic([25]);
   }
 }
 
 /* set unchecked: subtle reverse tick */
 function soundSetUndo(){
-  beep(330,0.05,0.15,'sine');
+  beep(330,0.06,0.4,'sine');
   haptic([10]);
 }
 
 /* rest timer started */
 function soundRestStart(){
-  beep(440,0.06,0.25,'sine');
-  beep(550,0.06,0.25,'sine',0.07);
+  beep(440,0.07,0.5,'triangle');
+  beep(550,0.07,0.5,'triangle',0.07);
   haptic([15,10,15]);
 }
 
 /* rest timer last 3 seconds countdown beep */
 function soundCountdown(){
-  beep(660,0.05,0.3,'square');
+  beep(660,0.06,0.65,'square');
   haptic([20]);
 }
 
 /* rest timer finished */
 function soundRestDone(){
-  beep(880,0.08,0.45,'sine');
-  beep(1100,0.08,0.45,'sine',0.10);
-  beep(880,0.12,0.45,'sine',0.20);
-  haptic([50,30,50,30,150]);
+  beep(880,0.09,0.8,'triangle');
+  beep(1100,0.09,0.8,'triangle',0.10);
+  beep(880,0.14,0.8,'triangle',0.20);
+  beep(1318,0.2,0.85,'triangle',0.32);
+  haptic([50,30,50,30,180]);
 }
 
 /* workout complete fanfare */
 function soundWorkoutDone(){
   const notes = [523,659,784,1047,784,1047,1319];
-  const durs  = [0.1,0.1,0.1,0.15,0.08,0.1,0.25];
+  const durs  = [0.11,0.11,0.11,0.16,0.09,0.11,0.3];
   let t = 0;
-  notes.forEach((f,i)=>{ beep(f,durs[i],0.45,'sine',t); t+=durs[i]+0.02; });
-  haptic([40,20,40,20,40,20,200]);
+  notes.forEach((f,i)=>{ beep(f,durs[i],0.8,'triangle',t); t+=durs[i]+0.02; });
+  haptic([40,20,40,20,40,20,220]);
 }
 
 /* add exercise to workout */
 function soundAddEx(){
-  beep(440,0.04,0.2,'sine');
+  beep(440,0.05,0.4,'sine');
   haptic([12]);
 }
 /* ============================================ */
@@ -1075,6 +1088,7 @@ let woInterval = null;
 let restInterval = null;
 
 function startWorkout(routineId){
+  ensureNotifPermission();
   const routine = routineId ? state.routines.find(r=>r.id===routineId) : null;
   state.activeWorkout = {
     id: uid(),
@@ -1275,33 +1289,113 @@ if(state.activeWorkout){
   woInterval = setInterval(updateWoTimer, 1000);
 }
 
-let restRemaining = 0, restTotal = 0;
+let restEndTime = 0, restTotal = 0, _lastCountdownSecond = null;
+
 function startRestTimer(seconds){
-  restTotal = seconds; restRemaining = seconds;
+  restTotal = seconds;
+  restEndTime = Date.now() + seconds*1000;
+  _lastCountdownSecond = null;
   document.getElementById("restTimer").classList.add("open");
-  updateRestUI();
   soundRestStart();
+  showRestNotification(seconds);
   clearInterval(restInterval);
-  restInterval = setInterval(()=>{
-    restRemaining--;
-    if(restRemaining<=0){ stopRestTimer(); soundRestDone(); return; }
-    if(restRemaining<=3) soundCountdown();
-    updateRestUI();
-  },1000);
+  tickRest();
+  /* tick every 250ms so the UI is smooth, but always compute remaining
+     from wall-clock time so backgrounding/throttling never causes drift */
+  restInterval = setInterval(tickRest, 250);
 }
-function updateRestUI(){
-  const m = Math.floor(restRemaining/60), s = restRemaining%60;
+
+function tickRest(){
+  const remaining = Math.max(0, Math.ceil((restEndTime - Date.now())/1000));
+  if(remaining !== _lastCountdownSecond){
+    _lastCountdownSecond = remaining;
+    if(remaining>0 && remaining<=3) soundCountdown();
+    document.title = remaining>0 ? `⏱ ${Math.floor(remaining/60)}:${String(remaining%60).padStart(2,"0")} rest — IronLog` : "IronLog";
+    if(remaining>0 && remaining%5===0) updateRestNotification(remaining);
+  }
+  updateRestUI(remaining);
+  if(remaining<=0){
+    stopRestTimer();
+    soundRestDone();
+  }
+}
+
+function updateRestUI(remaining){
+  const m = Math.floor(remaining/60), s = remaining%60;
   document.getElementById("restNum").textContent = `${m}:${String(s).padStart(2,"0")}`;
   const circumference = 138;
-  const frac = restTotal>0 ? restRemaining/restTotal : 0;
+  const frac = restTotal>0 ? remaining/restTotal : 0;
   document.getElementById("restRing").style.strokeDashoffset = (circumference*(1-frac)).toFixed(1);
 }
+
 function stopRestTimer(){
   clearInterval(restInterval);
   document.getElementById("restTimer").classList.remove("open");
+  document.title = "IronLog";
+  closeRestNotification();
 }
+
+function addRestTime(sec){
+  restEndTime += sec*1000;
+  restTotal += sec;
+  tickRest();
+  updateRestNotification(Math.max(0, Math.ceil((restEndTime - Date.now())/1000)));
+}
+
 document.getElementById("restSkip").onclick = stopRestTimer;
-document.getElementById("restAdd").onclick = ()=>{ restRemaining+=30; restTotal+=30; updateRestUI(); };
+document.getElementById("restAdd").onclick = ()=>addRestTime(30);
+
+/* re-sync the instant the tab/screen becomes visible again, since
+   background tabs can pause timers entirely on some devices */
+document.addEventListener("visibilitychange", ()=>{
+  if(document.visibilityState === "visible" && restEndTime && document.getElementById("restTimer").classList.contains("open")){
+    tickRest();
+  }
+});
+
+/* ===== Interactive rest notification (Skip / +30s actions via service worker) ===== */
+let _notifPermRequested = false;
+function ensureNotifPermission(){
+  if(!("Notification" in window) || _notifPermRequested) return;
+  _notifPermRequested = true;
+  if(Notification.permission === "default"){
+    Notification.requestPermission().catch(()=>{});
+  }
+}
+
+function showRestNotification(seconds){
+  if(!("serviceWorker" in navigator) || !("Notification" in window)) return;
+  if(Notification.permission !== "granted") return;
+  navigator.serviceWorker.ready.then(reg=>{
+    reg.showNotification("Resting", {
+      body: `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")} remaining`,
+      tag: "ironlog-rest",
+      renotify: false,
+      silent: true,
+      icon: "icon-192.png",
+      badge: "icon-192.png",
+      actions: [
+        {action:"skip", title:"Skip Rest"},
+        {action:"add30", title:"+30s"}
+      ]
+    }).catch(()=>{});
+  });
+}
+function updateRestNotification(remaining){
+  showRestNotification(remaining);
+}
+function closeRestNotification(){
+  if(!("serviceWorker" in navigator)) return;
+  navigator.serviceWorker.ready.then(reg=>{
+    reg.getNotifications({tag:"ironlog-rest"}).then(list=>list.forEach(n=>n.close()));
+  }).catch(()=>{});
+}
+if("serviceWorker" in navigator){
+  navigator.serviceWorker.addEventListener("message", (event)=>{
+    if(event.data === "rest-skip") stopRestTimer();
+    else if(event.data === "rest-add30") addRestTime(30);
+  });
+}
 
 function renderHistory(){
   const now = new Date();

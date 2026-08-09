@@ -27,3 +27,20 @@ self.addEventListener('fetch', e => {
     })
   );
 });
+
+self.addEventListener('notificationclick', event => {
+  event.notification.close();
+  const action = event.action; // "skip", "add30", or "" (body tap)
+  event.waitUntil(
+    self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(clientList => {
+      const msg = action === 'skip' ? 'rest-skip' : action === 'add30' ? 'rest-add30' : null;
+      let focused = null;
+      for (const client of clientList) {
+        if (msg) client.postMessage(msg);
+        if ('focus' in client) focused = client;
+      }
+      if (!msg && focused) return focused.focus();
+      if (!clientList.length && self.clients.openWindow) return self.clients.openWindow('./');
+    })
+  );
+});
