@@ -728,7 +728,18 @@ function allExercises(){ return BUILTIN_EXERCISES.concat(state.customExercises);
 function exById(id){ return allExercises().find(e=>e.id===id); }
 function fmtDate(d){ const dt = new Date(d); return dt.toLocaleDateString(undefined,{month:"short",day:"numeric"}); }
 function fmtDateFull(d){ const dt = new Date(d); return dt.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric",year:"numeric"}); }
-function todayISO(){ return new Date().toISOString().slice(0,10); }
+/* local calendar-day string (YYYY-MM-DD) using the device's local timezone.
+   toISOString() always converts to UTC first, which silently shifts the date
+   for anyone not in UTC+0 (e.g. a workout at 11pm UTC+5 becomes "yesterday").
+   Every place that needs "what day did this happen" must go through this. */
+function localDateStr(d){
+  const dt = (d instanceof Date) ? d : new Date(d);
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth()+1).padStart(2,"0");
+  const day = String(dt.getDate()).padStart(2,"0");
+  return `${y}-${m}-${day}`;
+}
+function todayISO(){ return localDateStr(new Date()); }
 
 function bestE1RM(exId, beforeDate){
   let best = 0;
@@ -746,19 +757,20 @@ function bestE1RM(exId, beforeDate){
 }
 
 function computeStreak(){
-  const days = [...new Set(state.history.map(w=>w.date.slice(0,10)))].sort().reverse();
+  const days = [...new Set(state.history.map(w=>localDateStr(w.date)))].sort().reverse();
   if(days.length===0) return 0;
   let streak = 0;
   let cursor = new Date(); cursor.setHours(0,0,0,0);
   let d = new Date(cursor);
   while(true){
-    const iso = d.toISOString().slice(0,10);
+    const iso = localDateStr(d);
     if(days.includes(iso)){ streak++; d.setDate(d.getDate()-1); }
-    else if(iso === cursor.toISOString().slice(0,10)){ d.setDate(d.getDate()-1); continue; }
+    else if(iso === localDateStr(cursor)){ d.setDate(d.getDate()-1); continue; }
     else break;
   }
   return streak;
 }
+
 
 let currentTab = "home";
 const screenEl = document.getElementById("screen");
@@ -1403,12 +1415,12 @@ function renderHistory(){
   const first = new Date(y,m,1);
   const startDow = first.getDay();
   const daysInMonth = new Date(y,m+1,0).getDate();
-  const workoutDays = new Set(state.history.map(w=>w.date.slice(0,10)));
+  const workoutDays = new Set(state.history.map(w=>localDateStr(w.date)));
 
   let cal = `<div class="cal-grid">` + ["S","M","T","W","T","F","S"].map(d=>`<div class="dow">${d}</div>`).join("");
   for(let i=0;i<startDow;i++) cal += `<div class="cal-day empty"></div>`;
   for(let d=1; d<=daysInMonth; d++){
-    const iso = new Date(y,m,d).toISOString().slice(0,10);
+    const iso = localDateStr(new Date(y,m,d));
     cal += `<div class="cal-day ${workoutDays.has(iso)?"has":""}">${d}</div>`;
   }
   cal += `</div>`;
