@@ -1,4 +1,4 @@
-const CACHE = 'ironlog-v5';
+const CACHE = 'ironlog-v6';
 const ASSETS = ['./'];
 
 self.addEventListener('install', e => {
@@ -30,19 +30,22 @@ self.addEventListener('fetch', e => {
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  const action = event.action; // "complete", "skip", "add30", or "" (body tap)
-  const ei = event.notification.data && event.notification.data.ei;
+  const action = event.action; // "complete", "skip", or "" (plain body tap)
   let msg = null;
   if (action === 'skip') msg = {type:'rest-skip'};
-  else if (action === 'add30') msg = {type:'rest-add30'};
-  else if (action === 'complete') msg = {type:'rest-complete-next', ei};
+  else if (action === 'complete') msg = {type:'rest-complete-next'};
+  const shouldFocus = !action; // only tapping the notification body should bring the app forward —
+                                // action-button taps (Skip / Log Set) stay in the background on purpose
   event.waitUntil(
     self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(async clientList => {
       const target = clientList.find(c => 'focus' in c) || null;
       if (target) {
         if (msg) target.postMessage(msg);
-        return target.focus();
+        if (shouldFocus) return target.focus();
+        return;
       }
+      // no page open at all — the only way to process the action is to open one,
+      // which unavoidably brings the app forward this one time
       if (self.clients.openWindow) {
         const newClient = await self.clients.openWindow('./');
         if (newClient && msg) {

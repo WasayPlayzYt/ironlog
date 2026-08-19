@@ -1154,6 +1154,7 @@ function startWorkout(routineId){
   clearInterval(woInterval);
   woInterval = setInterval(updateWoTimer, 1000);
   updateWoTimer();
+  refreshWorkoutNotification();
 }
 
 function updateWoTimer(){
@@ -1209,20 +1210,24 @@ function renderWorkoutBody(){
       startRestTimer(w.exercises[ei].restSeconds || state.settings.restSeconds, ei);
     } else { set.isPR = false; soundSetUndo(); }
     save(); renderWorkoutBody();
+    if(!set.completed) refreshWorkoutNotification();
   });
   body.querySelectorAll(".rmSet").forEach(b=>b.onclick=()=>{
     w.exercises[b.dataset.ei].sets.splice(b.dataset.si,1); save(); renderWorkoutBody();
+    refreshWorkoutNotification();
   });
   body.querySelectorAll(".addSetBtn").forEach(b=>b.onclick=()=>{
     const sets = w.exercises[b.dataset.ei].sets;
     const last = sets[sets.length-1];
     sets.push({weight:last?last.weight:0, reps:last?last.reps:0, completed:false, isPR:false});
     save(); renderWorkoutBody();
+    refreshWorkoutNotification();
   });
   body.querySelectorAll(".rm-exblock").forEach(b=>b.onclick=()=>{
     w.exercises.splice(b.dataset.ei,1); save(); renderWorkoutBody();
+    refreshWorkoutNotification();
   });
-  makeReorderable(body, ".exblock", w.exercises, ()=>{ save(); renderWorkoutBody(); });
+  makeReorderable(body, ".exblock", w.exercises, ()=>{ save(); renderWorkoutBody(); refreshWorkoutNotification(); });
 }
 
 function addExToActive(){
@@ -1234,6 +1239,7 @@ function addExToActive(){
     state.activeWorkout.exercises.push({exerciseId:ex.id, restSeconds: usage?usage.restSeconds:null, sets});
     soundAddEx();
     save(); closeModal(); renderWorkoutBody();
+    refreshWorkoutNotification();
   });
 }
 
@@ -1242,7 +1248,11 @@ document.getElementById("woCancel").onclick = ()=>{
     clearInterval(woInterval);
     state.activeWorkout = null; save();
     document.getElementById("workoutOverlay").classList.remove("open");
-    stopRestTimer();
+    _isResting = false;
+    clearInterval(restInterval);
+    document.getElementById("restTimer").classList.remove("open");
+    document.title = "IronLog";
+    closeWorkoutNotification();
   }
 };
 
@@ -1295,7 +1305,11 @@ document.getElementById("woFinish").onclick = ()=>{
     save();
     clearInterval(woInterval);
     document.getElementById("workoutOverlay").classList.remove("open");
-    stopRestTimer();
+    _isResting = false;
+    clearInterval(restInterval);
+    document.getElementById("restTimer").classList.remove("open");
+    document.title = "IronLog";
+    closeWorkoutNotification();
     soundWorkoutDone();
     currentTab = "home"; render();
   }
@@ -1338,23 +1352,21 @@ if(state.activeWorkout){
   woInterval = setInterval(updateWoTimer, 1000);
 }
 
-let restEndTime = 0, restTotal = 0, _lastCountdownSecond = null;
+let restEndTime = 0, restTotal = 0, _lastCountdownSecond = null, _isResting = false;
 
-let _restEi = null;
-
-function startRestTimer(seconds, ei){
+function startRestTimer(seconds){
   restTotal = seconds;
   restEndTime = Date.now() + seconds*1000;
   _lastCountdownSecond = null;
-  _restEi = (ei!==undefined && ei!==null) ? ei : null;
+  _isResting = true;
   document.getElementById("restTimer").classList.add("open");
   soundRestStart();
-  showRestNotification(seconds);
   clearInterval(restInterval);
   tickRest();
   /* tick every 250ms so the UI is smooth, but always compute remaining
      from wall-clock time so backgrounding/throttling never causes drift */
   restInterval = setInterval(tickRest, 250);
+  refreshWorkoutNotification();
 }
 
 function tickRest(){
@@ -1363,13 +1375,12 @@ function tickRest(){
     _lastCountdownSecond = remaining;
     if(remaining>0 && remaining<=3) soundCountdown();
     document.title = remaining>0 ? `⏱ ${Math.floor(remaining/60)}:${String(remaining%60).padStart(2,"0")} rest — IronLog` : "IronLog";
-    if(remaining>0 && remaining%5===0) updateRestNotification(remaining);
+    if(remaining>0 && remaining%5===0) refreshWorkoutNotification();
   }
   updateRestUI(remaining);
   if(remaining<=0){
-    stopRestTimer();
     soundRestDone();
-    fireRestDoneNotification();
+    stopRestTimer({alert:true});
   }
 }
 
@@ -1381,21 +1392,24 @@ function updateRestUI(remaining){
   document.getElementById("restRing").style.strokeDashoffset = (circumference*(1-frac)).toFixed(1);
 }
 
-function stopRestTimer(){
+/* opts.alert=true only for a natural rest-complete (worth an audible ping);
+   a manual skip stays quiet and just moves the notification to the "ready" state */
+function stopRestTimer(opts){
+  opts = opts || {};
   clearInterval(restInterval);
   document.getElementById("restTimer").classList.remove("open");
   document.title = "IronLog";
-  closeRestNotification();
+  _isResting = false;
+  refreshWorkoutNotification({alert: !!opts.alert});
 }
 
 function addRestTime(sec){
   restEndTime += sec*1000;
   restTotal += sec;
   tickRest();
-  updateRestNotification(Math.max(0, Math.ceil((restEndTime - Date.now())/1000)));
 }
 
-document.getElementById("restSkip").onclick = stopRestTimer;
+document.getElementById("restSkip").onclick = ()=>stopRestTimer({alert:false});
 document.getElementById("restAdd").onclick = ()=>addRestTime(30);
 
 /* re-sync the instant the tab/screen becomes visible again, since
@@ -1406,7 +1420,12 @@ document.addEventListener("visibilitychange", ()=>{
   }
 });
 
-/* ===== Interactive rest notification (Log Set / Skip actions via service worker) ===== */
+/* ===== Persistent workout notification (Log Set / Skip actions via service worker) =====
+   One notification lives for the whole active workout — from start to finish/discard —
+   instead of appearing only during rest. Its content is always recomputed fresh from
+   current state rather than captured once, so it can never point at a stale set, and
+   its action-button layout is kept identical across every "resting" update so a
+   background refresh can never shift which button is under the person's thumb. */
 let _notifPermRequested = false;
 function ensureNotifPermission(){
   if(!("Notification" in window) || _notifPermRequested) return;
@@ -1416,88 +1435,79 @@ function ensureNotifPermission(){
   }
 }
 
-/* builds the "next set" preview so the person knows exactly what tapping
-   the notification's checkmark will log — the exercise name and its
-   planned weight/reps, not just a bare countdown */
-function nextSetPreview(ei){
-  if(ei===null || ei===undefined || !state.activeWorkout) return null;
-  const exObj = state.activeWorkout.exercises[ei];
-  if(!exObj) return null;
-  const nextSet = exObj.sets.find(s=>!s.completed);
-  if(!nextSet) return null;
-  const meta = exById(exObj.exerciseId);
-  return {
-    name: meta ? meta.name : "Next set",
-    weight: nextSet.weight||0,
-    reps: nextSet.reps||0
-  };
+/* scans the active workout in order and returns the first exercise that still
+   has an incomplete set — this is what makes the notification naturally move
+   on to the next exercise once the current one's sets are all done */
+function getNextPendingSet(){
+  if(!state.activeWorkout) return null;
+  const exs = state.activeWorkout.exercises;
+  for(let ei=0; ei<exs.length; ei++){
+    const exObj = exs[ei];
+    const nextSet = exObj.sets.find(s=>!s.completed);
+    if(nextSet){
+      const meta = exById(exObj.exerciseId);
+      return {ei, exObj, nextSet, name: meta ? meta.name : "Exercise"};
+    }
+  }
+  return null;
 }
 
-function showRestNotification(seconds){
+function refreshWorkoutNotification(opts){
+  opts = opts || {};
   if(!("serviceWorker" in navigator) || !("Notification" in window)) return;
   if(Notification.permission !== "granted") return;
-  const timeStr = `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")}`;
-  const preview = nextSetPreview(_restEi);
-  let body, actions;
-  if(preview){
-    body = `Next: ${preview.weight}${state.settings.unit} × ${preview.reps} reps — ${preview.name}\n${timeStr} rest remaining`;
-    actions = [
-      {action:"complete", title:`✓ Log ${preview.weight}${state.settings.unit}×${preview.reps}`},
-      {action:"skip", title:"Skip Rest"}
-    ];
+  if(!state.activeWorkout){ closeWorkoutNotification(); return; }
+
+  const pending = getNextPendingSet();
+  let title, body, actions;
+
+  if(_isResting){
+    const remaining = Math.max(0, Math.ceil((restEndTime - Date.now())/1000));
+    const timeStr = `${Math.floor(remaining/60)}:${String(remaining%60).padStart(2,"0")}`;
+    title = "IronLog — Resting";
+    if(pending){
+      body = `Resting ${timeStr} — Next: ${pending.nextSet.weight}${state.settings.unit}×${pending.nextSet.reps} ${pending.name}`;
+      actions = [{action:"skip", title:"Skip Rest"}, {action:"complete", title:"✓ Log Set"}];
+    } else {
+      body = `Resting ${timeStr}`;
+      actions = [{action:"skip", title:"Skip Rest"}];
+    }
+  } else if(pending){
+    title = "IronLog — Ready";
+    body = `Up next: ${pending.nextSet.weight}${state.settings.unit}×${pending.nextSet.reps} — ${pending.name}`;
+    actions = [{action:"complete", title:"✓ Log Set"}];
   } else {
-    body = `${timeStr} remaining`;
-    actions = [{action:"skip", title:"Skip Rest"}, {action:"add30", title:"+30s"}];
+    title = "IronLog — Workout Complete";
+    body = "All sets logged — tap Finish Workout in the app 💪";
+    actions = [];
   }
+
   navigator.serviceWorker.ready.then(reg=>{
-    reg.showNotification("IronLog — Resting", {
+    reg.showNotification(title, {
       body,
-      tag: "ironlog-rest",
-      renotify: false,
-      silent: true,
+      tag: "ironlog-workout",
+      renotify: !!opts.alert,
+      silent: !opts.alert,
+      vibrate: opts.alert ? [50,30,50,30,180] : undefined,
       icon: "icon-192.png",
       badge: "icon-192.png",
-      data: {ei: _restEi},
+      requireInteraction: true,
       actions
     }).catch(()=>{});
   });
 }
-function updateRestNotification(remaining){
-  showRestNotification(remaining);
-}
-function closeRestNotification(){
+
+function closeWorkoutNotification(){
   if(!("serviceWorker" in navigator)) return;
   navigator.serviceWorker.ready.then(reg=>{
-    reg.getNotifications({tag:"ironlog-rest"}).then(list=>list.forEach(n=>n.close()));
+    reg.getNotifications({tag:"ironlog-workout"}).then(list=>list.forEach(n=>n.close()));
   }).catch(()=>{});
 }
 
-/* fired the instant rest hits zero — unlike the countdown updates, this one
-   is NOT silent: it uses the device's own notification sound + vibration
-   channel, which (unlike a WebAudio beep) can still fire even if the tab
-   itself is throttled or the screen is off */
-function fireRestDoneNotification(){
-  if(!("serviceWorker" in navigator) || !("Notification" in window)) return;
-  if(Notification.permission !== "granted") return;
-  navigator.serviceWorker.ready.then(reg=>{
-    reg.showNotification("Rest Complete — IronLog", {
-      body: "Time for your next set 💪",
-      tag: "ironlog-rest",
-      renotify: true,
-      silent: false,
-      vibrate: [50,30,50,30,180],
-      icon: "icon-192.png",
-      badge: "icon-192.png"
-    }).catch(()=>{});
-  });
-}
-
-function completeNextSetFromNotification(ei){
-  if(ei===null || ei===undefined || !state.activeWorkout) return;
-  const exObj = state.activeWorkout.exercises[ei];
-  if(!exObj) return;
-  const nextSet = exObj.sets.find(s=>!s.completed);
-  if(!nextSet) return;
+function completeNextSetFromNotification(){
+  const pending = getNextPendingSet();
+  if(!pending) return;
+  const {exObj, nextSet} = pending;
   nextSet.completed = true;
   const best = bestE1RM(exObj.exerciseId);
   const e1 = EPLEY(nextSet.weight, nextSet.reps);
@@ -1505,16 +1515,15 @@ function completeNextSetFromNotification(ei){
   soundSetDone(nextSet.isPR);
   save();
   if(document.getElementById("workoutOverlay").classList.contains("open")) renderWorkoutBody();
-  startRestTimer(exObj.restSeconds || state.settings.restSeconds, ei);
+  startRestTimer(exObj.restSeconds || state.settings.restSeconds);
 }
 
 if("serviceWorker" in navigator){
   navigator.serviceWorker.addEventListener("message", (event)=>{
     const d = event.data;
     if(!d || !d.type) return;
-    if(d.type === "rest-skip") stopRestTimer();
-    else if(d.type === "rest-add30") addRestTime(30);
-    else if(d.type === "rest-complete-next") completeNextSetFromNotification(d.ei);
+    if(d.type === "rest-skip") stopRestTimer({alert:false});
+    else if(d.type === "rest-complete-next") completeNextSetFromNotification();
   });
 }
 
