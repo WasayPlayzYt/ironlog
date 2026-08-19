@@ -1,4 +1,4 @@
-const CACHE = 'ironlog-v3';
+const CACHE = 'ironlog-v5';
 const ASSETS = ['./'];
 
 self.addEventListener('install', e => {
@@ -30,17 +30,26 @@ self.addEventListener('fetch', e => {
 
 self.addEventListener('notificationclick', event => {
   event.notification.close();
-  const action = event.action; // "skip", "add30", or "" (body tap)
+  const action = event.action; // "complete", "skip", "add30", or "" (body tap)
+  const ei = event.notification.data && event.notification.data.ei;
+  let msg = null;
+  if (action === 'skip') msg = {type:'rest-skip'};
+  else if (action === 'add30') msg = {type:'rest-add30'};
+  else if (action === 'complete') msg = {type:'rest-complete-next', ei};
   event.waitUntil(
-    self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(clientList => {
-      const msg = action === 'skip' ? 'rest-skip' : action === 'add30' ? 'rest-add30' : null;
-      let focused = null;
-      for (const client of clientList) {
-        if (msg) client.postMessage(msg);
-        if ('focus' in client) focused = client;
+    self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(async clientList => {
+      const target = clientList.find(c => 'focus' in c) || null;
+      if (target) {
+        if (msg) target.postMessage(msg);
+        return target.focus();
       }
-      if (!msg && focused) return focused.focus();
-      if (!clientList.length && self.clients.openWindow) return self.clients.openWindow('./');
+      if (self.clients.openWindow) {
+        const newClient = await self.clients.openWindow('./');
+        if (newClient && msg) {
+          setTimeout(() => newClient.postMessage(msg), 1200);
+        }
+        return newClient;
+      }
     })
   );
 });

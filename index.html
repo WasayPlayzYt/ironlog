@@ -172,7 +172,7 @@ h2.section-title:first-child{margin-top:6px;}
 <script>
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js')
+    navigator.serviceWorker.register('./sw.js', {scope: './'})
       .then(r => console.log('SW registered:', r.scope))
       .catch(e => console.log('SW error:', e));
   });
@@ -726,6 +726,34 @@ function save(){ localStorage.setItem(STORE_KEY, JSON.stringify(state)); }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
 function allExercises(){ return BUILTIN_EXERCISES.concat(state.customExercises); }
 function exById(id){ return allExercises().find(e=>e.id===id); }
+
+/* find how this exercise was last configured/performed, anywhere in the app —
+   most recent actual workout takes priority, falling back to any routine that
+   already has it configured. Used so a weight/rep combo you've already dialed
+   in doesn't need to be re-entered every time the exercise shows up again. */
+function getLastExerciseUsage(exerciseId){
+  const sortedHistory = [...state.history].sort((a,b)=>b.date.localeCompare(a.date));
+  for(const w of sortedHistory){
+    const e = w.exercises.find(e=>e.exerciseId===exerciseId);
+    if(e && e.sets && e.sets.length){
+      return {
+        sets: e.sets.map(s=>({weight:s.weight||0, reps:s.reps||0})),
+        restSeconds: e.restSeconds || null
+      };
+    }
+  }
+  for(const r of state.routines){
+    const e = r.exercises.find(e=>e.exerciseId===exerciseId);
+    if(e && e.sets && e.sets.length){
+      return {
+        sets: e.sets.map(s=>({weight:s.weight||0, reps:s.reps||0})),
+        restSeconds: e.restSeconds || null
+      };
+    }
+  }
+  return null;
+}
+
 function fmtDate(d){ const dt = new Date(d); return dt.toLocaleDateString(undefined,{month:"short",day:"numeric"}); }
 function fmtDateFull(d){ const dt = new Date(d); return dt.toLocaleDateString(undefined,{weekday:"long",month:"long",day:"numeric",year:"numeric"}); }
 /* local calendar-day string (YYYY-MM-DD) using the device's local timezone.
@@ -906,7 +934,12 @@ function openRoutineEditor(routineId){
     document.getElementById("rName").oninput = (e)=>draft.name=e.target.value;
     document.getElementById("addExBtn").onclick = ()=>{
       openExercisePicker((ex)=>{
-        draft.exercises.push({exerciseId:ex.id, sets:[{weight:0,reps:10},{weight:0,reps:10},{weight:0,reps:10}], restSeconds:null});
+        const usage = getLastExerciseUsage(ex.id);
+        if(usage){
+          draft.exercises.push({exerciseId:ex.id, sets:usage.sets.map(s=>({weight:s.weight, reps:s.reps})), restSeconds:usage.restSeconds});
+        } else {
+          draft.exercises.push({exerciseId:ex.id, sets:[{weight:0,reps:10},{weight:0,reps:10},{weight:0,reps:10}], restSeconds:null});
+        }
         openModal(body()); wireRoutineEditorEvents();
       });
     };
@@ -1173,7 +1206,7 @@ function renderWorkoutBody(){
       const e1 = EPLEY(set.weight, set.reps);
       set.isPR = set.weight>0 && e1 > best;
       soundSetDone(set.isPR);
-      startRestTimer(w.exercises[ei].restSeconds || state.settings.restSeconds);
+      startRestTimer(w.exercises[ei].restSeconds || state.settings.restSeconds, ei);
     } else { set.isPR = false; soundSetUndo(); }
     save(); renderWorkoutBody();
   });
@@ -1194,7 +1227,11 @@ function renderWorkoutBody(){
 
 function addExToActive(){
   openExercisePicker((ex)=>{
-    state.activeWorkout.exercises.push({exerciseId:ex.id, restSeconds:null, sets:[{weight:0,reps:10,completed:false,isPR:false}]});
+    const usage = getLastExerciseUsage(ex.id);
+    const sets = usage
+      ? usage.sets.map(s=>({weight:s.weight, reps:s.reps, completed:false, isPR:false}))
+      : [{weight:0,reps:10,completed:false,isPR:false}];
+    state.activeWorkout.exercises.push({exerciseId:ex.id, restSeconds: usage?usage.restSeconds:null, sets});
     soundAddEx();
     save(); closeModal(); renderWorkoutBody();
   });
@@ -1303,10 +1340,13 @@ if(state.activeWorkout){
 
 let restEndTime = 0, restTotal = 0, _lastCountdownSecond = null;
 
-function startRestTimer(seconds){
+let _restEi = null;
+
+function startRestTimer(seconds, ei){
   restTotal = seconds;
   restEndTime = Date.now() + seconds*1000;
   _lastCountdownSecond = null;
+  _restEi = (ei!==undefined && ei!==null) ? ei : null;
   document.getElementById("restTimer").classList.add("open");
   soundRestStart();
   showRestNotification(seconds);
@@ -1329,6 +1369,7 @@ function tickRest(){
   if(remaining<=0){
     stopRestTimer();
     soundRestDone();
+    fireRestDoneNotification();
   }
 }
 
@@ -1365,7 +1406,7 @@ document.addEventListener("visibilitychange", ()=>{
   }
 });
 
-/* ===== Interactive rest notification (Skip / +30s actions via service worker) ===== */
+/* ===== Interactive rest notification (Log Set / Skip actions via service worker) ===== */
 let _notifPermRequested = false;
 function ensureNotifPermission(){
   if(!("Notification" in window) || _notifPermRequested) return;
@@ -1375,21 +1416,49 @@ function ensureNotifPermission(){
   }
 }
 
+/* builds the "next set" preview so the person knows exactly what tapping
+   the notification's checkmark will log — the exercise name and its
+   planned weight/reps, not just a bare countdown */
+function nextSetPreview(ei){
+  if(ei===null || ei===undefined || !state.activeWorkout) return null;
+  const exObj = state.activeWorkout.exercises[ei];
+  if(!exObj) return null;
+  const nextSet = exObj.sets.find(s=>!s.completed);
+  if(!nextSet) return null;
+  const meta = exById(exObj.exerciseId);
+  return {
+    name: meta ? meta.name : "Next set",
+    weight: nextSet.weight||0,
+    reps: nextSet.reps||0
+  };
+}
+
 function showRestNotification(seconds){
   if(!("serviceWorker" in navigator) || !("Notification" in window)) return;
   if(Notification.permission !== "granted") return;
+  const timeStr = `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")}`;
+  const preview = nextSetPreview(_restEi);
+  let body, actions;
+  if(preview){
+    body = `Next: ${preview.weight}${state.settings.unit} × ${preview.reps} reps — ${preview.name}\n${timeStr} rest remaining`;
+    actions = [
+      {action:"complete", title:`✓ Log ${preview.weight}${state.settings.unit}×${preview.reps}`},
+      {action:"skip", title:"Skip Rest"}
+    ];
+  } else {
+    body = `${timeStr} remaining`;
+    actions = [{action:"skip", title:"Skip Rest"}, {action:"add30", title:"+30s"}];
+  }
   navigator.serviceWorker.ready.then(reg=>{
-    reg.showNotification("Resting", {
-      body: `${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,"0")} remaining`,
+    reg.showNotification("IronLog — Resting", {
+      body,
       tag: "ironlog-rest",
       renotify: false,
       silent: true,
       icon: "icon-192.png",
       badge: "icon-192.png",
-      actions: [
-        {action:"skip", title:"Skip Rest"},
-        {action:"add30", title:"+30s"}
-      ]
+      data: {ei: _restEi},
+      actions
     }).catch(()=>{});
   });
 }
@@ -1402,10 +1471,50 @@ function closeRestNotification(){
     reg.getNotifications({tag:"ironlog-rest"}).then(list=>list.forEach(n=>n.close()));
   }).catch(()=>{});
 }
+
+/* fired the instant rest hits zero — unlike the countdown updates, this one
+   is NOT silent: it uses the device's own notification sound + vibration
+   channel, which (unlike a WebAudio beep) can still fire even if the tab
+   itself is throttled or the screen is off */
+function fireRestDoneNotification(){
+  if(!("serviceWorker" in navigator) || !("Notification" in window)) return;
+  if(Notification.permission !== "granted") return;
+  navigator.serviceWorker.ready.then(reg=>{
+    reg.showNotification("Rest Complete — IronLog", {
+      body: "Time for your next set 💪",
+      tag: "ironlog-rest",
+      renotify: true,
+      silent: false,
+      vibrate: [50,30,50,30,180],
+      icon: "icon-192.png",
+      badge: "icon-192.png"
+    }).catch(()=>{});
+  });
+}
+
+function completeNextSetFromNotification(ei){
+  if(ei===null || ei===undefined || !state.activeWorkout) return;
+  const exObj = state.activeWorkout.exercises[ei];
+  if(!exObj) return;
+  const nextSet = exObj.sets.find(s=>!s.completed);
+  if(!nextSet) return;
+  nextSet.completed = true;
+  const best = bestE1RM(exObj.exerciseId);
+  const e1 = EPLEY(nextSet.weight, nextSet.reps);
+  nextSet.isPR = nextSet.weight>0 && e1 > best;
+  soundSetDone(nextSet.isPR);
+  save();
+  if(document.getElementById("workoutOverlay").classList.contains("open")) renderWorkoutBody();
+  startRestTimer(exObj.restSeconds || state.settings.restSeconds, ei);
+}
+
 if("serviceWorker" in navigator){
   navigator.serviceWorker.addEventListener("message", (event)=>{
-    if(event.data === "rest-skip") stopRestTimer();
-    else if(event.data === "rest-add30") addRestTime(30);
+    const d = event.data;
+    if(!d || !d.type) return;
+    if(d.type === "rest-skip") stopRestTimer();
+    else if(d.type === "rest-add30") addRestTime(30);
+    else if(d.type === "rest-complete-next") completeNextSetFromNotification(d.ei);
   });
 }
 
@@ -1533,14 +1642,26 @@ function renderProgress(){
     </div>`;
   }
 
-  const bwPoints = [...state.bodyweight].sort((a,b)=>a.date.localeCompare(b.date)).map((b,i)=>({x:i,y:b.weight}));
+  const bwSorted = [...state.bodyweight].sort((a,b)=>b.date.localeCompare(a.date));
+  const bwChartPoints = [...state.bodyweight].sort((a,b)=>a.date.localeCompare(b.date)).map((b,i)=>({x:i,y:b.weight}));
   html += `<h2 class="section-title">Body Weight</h2>
   <div class="chart-wrap">
-    ${svgLineChart(bwPoints)}
+    ${svgLineChart(bwChartPoints)}
     <div class="row" style="margin-top:10px;gap:8px">
       <input id="bwInput" type="number" inputmode="decimal" placeholder="Weight (${state.settings.unit})" style="flex:1;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:9px 10px;border-radius:8px">
       <button class="btn btn-primary btn-sm" id="bwAdd">Log</button>
     </div>
+    ${bwSorted.length ? `<div style="margin-top:14px">${bwSorted.slice(0,15).map(b=>{
+      const idx = state.bodyweight.indexOf(b);
+      return `<div class="row" style="padding:8px 0;border-bottom:1px solid var(--border)">
+        <div class="muted" style="font-size:13px">${fmtDate(b.date)}</div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <span class="mono" style="font-weight:700">${b.weight} ${state.settings.unit}</span>
+          <button class="delbtn edit-bw" data-idx="${idx}" title="Edit">✎</button>
+          <button class="delbtn del-bw" data-idx="${idx}" title="Delete">✕</button>
+        </div>
+      </div>`;
+    }).join("")}</div>` : ""}
   </div>`;
 
   screenEl.innerHTML = html;
@@ -1551,6 +1672,32 @@ function renderProgress(){
     state.bodyweight.push({date:todayISO(), weight:val});
     save(); renderProgress();
   };
+  screenEl.querySelectorAll(".edit-bw").forEach(b=>b.onclick=()=>{
+    const idx = parseInt(b.dataset.idx);
+    const entry = state.bodyweight[idx];
+    if(!entry) return;
+    openModal(`
+      <div class="modal-title">Edit Weight<span class="x" id="mClose">&times;</span></div>
+      <div class="field"><label>Date</label><input id="bwEditDate" type="date" value="${entry.date}"></div>
+      <div class="field"><label>Weight (${state.settings.unit})</label><input id="bwEditWeight" type="number" inputmode="decimal" value="${entry.weight}"></div>
+      <button class="btn btn-primary btn-block" id="bwEditSave">Save</button>
+    `);
+    document.getElementById("mClose").onclick = closeModal;
+    document.getElementById("bwEditSave").onclick = ()=>{
+      const newVal = parseFloat(document.getElementById("bwEditWeight").value);
+      const newDate = document.getElementById("bwEditDate").value;
+      if(!newVal || !newDate) return;
+      state.bodyweight[idx] = {date:newDate, weight:newVal};
+      save(); closeModal(); renderProgress();
+    };
+  });
+  screenEl.querySelectorAll(".del-bw").forEach(b=>b.onclick=()=>{
+    const idx = parseInt(b.dataset.idx);
+    if(confirm("Delete this weight entry?")){
+      state.bodyweight.splice(idx,1);
+      save(); renderProgress();
+    }
+  });
 }
 
 function renderSettings(){
